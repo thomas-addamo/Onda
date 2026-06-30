@@ -10,8 +10,6 @@ import OndaShared
 public final class Compositor {
     private let context: MetalContext
     private let pipelineState: MTLRenderPipelineState
-    private var outputTexture: MTLTexture?
-    private var outputSize: (width: Int, height: Int) = (0, 0)
 
     public init(context: MetalContext) throws {
         self.context = context
@@ -38,17 +36,14 @@ public final class Compositor {
         }
     }
 
-    /// Compone i layer (dal fondo verso l'alto) nella texture di output e
-    /// restituisce la texture risultato. Il command buffer NON viene committato
-    /// qui: lo gestisce il chiamante (es. per accodare encode/preview).
+    /// Compone i layer (dal fondo verso l'alto) nella texture target fornita dal
+    /// chiamante (il drawable della preview, oppure una texture IOSurface-backed
+    /// per l'encode). Il command buffer NON viene committato qui.
     public func compose(
         layers: [LayerDraw],
-        outputFormat: VideoFormat,
+        into target: MTLTexture,
         commandBuffer: MTLCommandBuffer
-    ) -> MTLTexture? {
-        let target = ensureOutputTexture(width: outputFormat.width, height: outputFormat.height)
-        guard let target else { return nil }
-
+    ) {
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
         pass.colorAttachments[0].loadAction = .clear
@@ -56,7 +51,7 @@ public final class Compositor {
         pass.colorAttachments[0].storeAction = .store
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
-            return nil
+            return
         }
         encoder.setRenderPipelineState(pipelineState)
 
@@ -70,27 +65,6 @@ public final class Compositor {
         }
 
         encoder.endEncoding()
-        return target
-    }
-
-    // MARK: - Texture di output (riusata)
-
-    private func ensureOutputTexture(width: Int, height: Int) -> MTLTexture? {
-        if let outputTexture, outputSize == (width, height) {
-            return outputTexture
-        }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
-        let texture = context.device.makeTexture(descriptor: desc)
-        outputTexture = texture
-        outputSize = (width, height)
-        return texture
     }
 
     // MARK: - Pipeline

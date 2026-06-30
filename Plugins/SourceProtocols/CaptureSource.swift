@@ -1,15 +1,6 @@
 import Foundation
 import OndaShared
 
-/// Categoria di una sorgente di cattura, per UI e logica di scena.
-public enum CaptureSourceKind: Sendable, Equatable {
-    case display       // schermo intero (ScreenCaptureKit)
-    case window        // singola finestra (ScreenCaptureKit)
-    case camera        // webcam / capture card (AVFoundation)
-    case staticImage   // immagine o colore fisso
-    case text          // overlay testuale renderizzato a texture
-}
-
 /// Closure invocata per ogni frame prodotto da una sorgente.
 ///
 /// IMPORTANTE: viene chiamata sulla queue di delivery della sorgente (alta

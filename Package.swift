@@ -59,6 +59,15 @@ let package = Package(
             path: "Core/OutputEngine",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .target(
+            name: "SessionEngine",
+            dependencies: [
+                "OndaShared", "SourceProtocols",
+                "CaptureEngine", "RenderEngine", "OutputEngine", "AudioEngine",
+            ],
+            path: "Core/SessionEngine",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
 
         // MARK: - App (AppKit + SwiftUI)
         .executableTarget(
@@ -71,6 +80,7 @@ let package = Package(
                 "RenderEngine",
                 "AudioEngine",
                 "OutputEngine",
+                "SessionEngine",
             ],
             path: "App/OndaApp",
             swiftSettings: [.swiftLanguageMode(.v5)]

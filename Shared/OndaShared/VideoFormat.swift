@@ -2,7 +2,7 @@ import CoreVideo
 
 /// Descrive il formato di un flusso video: dimensioni, pixel format e frame rate.
 /// Value type immutabile, sicuro da passare tra thread.
-public struct VideoFormat: Sendable, Equatable {
+public struct VideoFormat: Sendable, Equatable, Codable {
     public var width: Int
     public var height: Int
     /// OSType del pixel format CoreVideo (es. `kCVPixelFormatType_32BGRA`,

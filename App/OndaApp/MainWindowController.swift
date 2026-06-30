@@ -1,5 +1,7 @@
 import AppKit
 import Metal
+import OndaShared
+import SessionEngine
 
 /// Finestra principale in stile "regia": multiview delle inquadrature, Preview e
 /// Program affiancati (studio mode), mixer audio e barra di controllo.
@@ -8,6 +10,8 @@ import Metal
 /// I pannelli secondari (impostazioni, dettaglio mixer) saranno in SwiftUI.
 final class MainWindowController: NSWindowController {
     private let device = MTLCreateSystemDefaultDevice()
+    private var session: StreamSession?
+    private var programPreview: MetalPreviewView?
 
     init() {
         let window = NSWindow(
@@ -27,6 +31,36 @@ final class MainWindowController: NSWindowController {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        startSession()
+    }
+
+    /// Crea la sessione live, aggancia la preview Program e avvia con la
+    /// configurazione persistita (o la demo col pattern di test).
+    private func startSession() {
+        guard session == nil, let programPreview else { return }
+        do {
+            let session = try StreamSession()
+            session.attachPreview(layer: programPreview.metalLayer)
+            self.session = session
+
+            let config: AppConfiguration
+            if let store = try? ConfigurationStore(), let loaded = try? store.loadOrCreateDemo() {
+                config = loaded
+            } else {
+                config = .demo
+            }
+
+            Task {
+                do { try await session.start(configuration: config) }
+                catch { OndaLog.app.error("Avvio sessione fallito: \(String(describing: error))") }
+            }
+        } catch {
+            OndaLog.app.error("StreamSession non creata: \(String(describing: error))")
+        }
+    }
 
     // MARK: - Composizione layout
 
@@ -81,8 +115,10 @@ final class MainWindowController: NSWindowController {
 
     /// Area centrale: Preview + Program affiancati, sotto la multiview.
     private func buildStudioArea() -> NSView {
-        let preview = labeledPreview("PREVIEW", accent: .systemGreen)
-        let program = labeledPreview("PROGRAM", accent: .systemRed)
+        let programView = MetalPreviewView(device: device)
+        self.programPreview = programView
+        let preview = wrapPreview(MetalPreviewView(device: device), title: "PREVIEW", accent: .systemGreen)
+        let program = wrapPreview(programView, title: "PROGRAM", accent: .systemRed)
 
         let topRow = NSStackView(views: [preview, program])
         topRow.orientation = .horizontal
@@ -234,7 +270,7 @@ final class MainWindowController: NSWindowController {
         return box
     }
 
-    private func labeledPreview(_ title: String, accent: NSColor) -> NSView {
+    private func wrapPreview(_ preview: MetalPreviewView, title: String, accent: NSColor) -> NSView {
         let container = NSView()
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.black.cgColor
@@ -242,7 +278,6 @@ final class MainWindowController: NSWindowController {
         container.layer?.borderColor = accent.cgColor
         container.layer?.borderWidth = 2
 
-        let preview = MetalPreviewView(device: device)
         preview.translatesAutoresizingMaskIntoConstraints = false
 
         let badge = makeLabel(title, size: 11, color: accent)
