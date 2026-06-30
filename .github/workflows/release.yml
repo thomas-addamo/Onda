@@ -1,0 +1,53 @@
+# Build e pubblicazione di una Release di Onda al push di un tag v*.
+#
+# Runner macOS gratuito e illimitato sui repository pubblici.
+#
+# Secret richiesti (Settings -> Secrets and variables -> Actions), da aggiungere
+# quando il progetto avra' la fase Xcode/firma:
+#   SIGNING_CERTIFICATE_P12_BASE64  -> certificato self-signed .p12 in base64
+#   SIGNING_CERTIFICATE_PASSWORD    -> password del .p12
+#   KEYCHAIN_PASSWORD               -> password temporanea del keychain CI
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mostra toolchain
+        run: |
+          swift --version
+          xcodebuild -version || true
+
+      - name: Build (SwiftPM Release)
+        run: swift build -c release
+
+      # TODO: import del certificato self-signed dai secret, firma del .app,
+      # creazione del .dmg/.zip. Da abilitare con la fase Xcode (vedi CLAUDE.md).
+      # - name: Import signing certificate
+      #   run: |
+      #     echo "$SIGNING_CERTIFICATE_P12_BASE64" | base64 --decode > cert.p12
+      #     security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+      #     security import cert.p12 -k build.keychain -P "$SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+
+      - name: Crea archivio (placeholder)
+        run: |
+          mkdir -p dist
+          BIN="$(swift build -c release --show-bin-path)/Onda"
+          cp "$BIN" dist/Onda
+          cd dist && zip -r Onda-${GITHUB_REF_NAME}.zip Onda
+
+      - name: Pubblica Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Onda-*.zip
