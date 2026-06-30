@@ -21,6 +21,11 @@ final class MainWindowController: NSWindowController {
     private var renderStatLabel: NSTextField?
     private var recStart: Date?
 
+    private var configuration = AppConfiguration.demo
+    private var sceneNameLabel: NSTextField?
+    private var sceneButtons: [NSButton] = []
+    private weak var sceneListContainer: NSView?
+
     init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1320, height: 840),
@@ -36,6 +41,12 @@ final class MainWindowController: NSWindowController {
         window.minSize = NSSize(width: 1100, height: 700)
         window.center()
         super.init(window: window)
+
+        // Carica la configurazione persistita (o la demo) prima di costruire la
+        // UI, cosi' sidebar e top bar riflettono scene/sorgenti reali.
+        if let store = try? ConfigurationStore(), let loaded = try? store.loadOrCreateDemo() {
+            configuration = loaded
+        }
         window.contentView = buildRootView()
     }
 
@@ -56,13 +67,7 @@ final class MainWindowController: NSWindowController {
             session.attachPreview(layer: programPreview.metalLayer)
             self.session = session
 
-            let config: AppConfiguration
-            if let store = try? ConfigurationStore(), let loaded = try? store.loadOrCreateDemo() {
-                config = loaded
-            } else {
-                config = .demo
-            }
-
+            let config = configuration
             Task {
                 do { try await session.start(configuration: config) }
                 catch { OndaLog.app.error("Avvio sessione fallito: \(String(describing: error))") }
@@ -160,7 +165,13 @@ final class MainWindowController: NSWindowController {
 
         // Wordmark con pallino accent (spazio per il semaforo della finestra).
         let mark = trackedLabel("ONDA", size: 15, weight: .bold, color: OndaColor.textPrimary, tracking: 2)
-        let scene = trackedLabel("Scena principale", size: 12, weight: .medium, color: OndaColor.textSecondary, tracking: 0.3)
+
+        let activeName = configuration.scenes.first { $0.id == configuration.activeSceneID }?.name
+            ?? configuration.scenes.first?.name ?? "—"
+        let scene = NSTextField(labelWithString: activeName)
+        scene.font = OndaFont.ui(12, .medium)
+        scene.textColor = OndaColor.textSecondary
+        self.sceneNameLabel = scene
 
         let left = NSStackView(views: [mark, scene])
         left.orientation = .horizontal
@@ -200,18 +211,13 @@ final class MainWindowController: NSWindowController {
 
     private func buildSidebar() -> NSView {
         let scenes = PanelView(title: "Scene")
-        fillList(scenes.body, items: [
-            ("Scena principale", OndaColor.accentRed),
-            ("Intermezzo", OndaColor.textTertiary),
-            ("Schermata pausa", OndaColor.textTertiary),
-        ])
+        buildSceneList(into: scenes.body)
+
         let sources = PanelView(title: "Sorgenti")
-        fillList(sources.body, items: [
-            ("Pattern di test", OndaColor.accentGreen),
-            ("Schermo intero", OndaColor.textTertiary),
-            ("Webcam", OndaColor.textTertiary),
-            ("Overlay testo", OndaColor.textTertiary),
-        ])
+        let sourceItems = configuration.sources.map { source -> (String, NSColor) in
+            (source.name, source.kind == .testPattern ? OndaColor.accentGreen : OndaColor.textTertiary)
+        }
+        fillList(sources.body, items: sourceItems.isEmpty ? [("Nessuna sorgente", OndaColor.textTertiary)] : sourceItems)
 
         let stack = NSStackView(views: [scenes, sources])
         stack.orientation = .vertical
@@ -219,6 +225,95 @@ final class MainWindowController: NSWindowController {
         stack.distribution = .fillEqually
         stack.widthAnchor.constraint(equalToConstant: 234).isActive = true
         return stack
+    }
+
+    /// Costruisce le righe di scena cliccabili (cambio scena con dissolvenza).
+    private func buildSceneList(into container: NSView) {
+        sceneListContainer = container
+        sceneButtons.removeAll()
+        let rows = configuration.scenes.enumerated().map { index, scene in
+            sceneRow(index: index, name: scene.name)
+        }
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.spacing = 2
+        stack.alignment = .leading
+        stack.distribution = .fill
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        pin(stack, to: container, top: true)
+    }
+
+    private func sceneRow(index: Int, name: String) -> NSView {
+        let isActive = configuration.scenes[index].id == configuration.activeSceneID
+
+        let row = NSView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 6
+        row.layer?.backgroundColor = (isActive ? OndaColor.panelElevated : .clear).cgColor
+
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.backgroundColor = (isActive ? OndaColor.accentRed : OndaColor.textTertiary).cgColor
+        dot.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: name)
+        label.font = OndaFont.ui(12.5, isActive ? .semibold : .medium)
+        label.textColor = isActive ? OndaColor.textPrimary : OndaColor.textSecondary
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        // Hit area trasparente che copre tutta la riga.
+        let button = NSButton(title: "", target: self, action: #selector(switchScene(_:)))
+        button.isBordered = false
+        button.isTransparent = true
+        button.tag = index
+        button.translatesAutoresizingMaskIntoConstraints = false
+        sceneButtons.append(button)
+
+        row.addSubview(dot)
+        row.addSubview(label)
+        row.addSubview(button)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 28),
+            row.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
+            dot.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 9),
+            label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            button.topAnchor.constraint(equalTo: row.topAnchor),
+            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+        ])
+        return row
+    }
+
+    @objc private func switchScene(_ sender: NSButton) {
+        let index = sender.tag
+        guard configuration.scenes.indices.contains(index) else { return }
+        let scene = configuration.scenes[index]
+        session?.switchToScene(id: scene.id, kind: .fade, duration: 0.4)
+
+        configuration.activeSceneID = scene.id
+        sceneNameLabel?.stringValue = scene.name
+        rebuildSceneList()
+        persistConfiguration()
+    }
+
+    private func rebuildSceneList() {
+        // Ricostruisce le righe per aggiornare l'evidenziazione della scena attiva.
+        guard let container = sceneListContainer else { return }
+        container.subviews.forEach { $0.removeFromSuperview() }
+        buildSceneList(into: container)
+    }
+
+    private func persistConfiguration() {
+        if let store = try? ConfigurationStore() {
+            try? store.save(configuration)
+        }
     }
 
     private func buildStudioArea() -> NSView {

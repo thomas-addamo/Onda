@@ -72,17 +72,26 @@ public struct AppConfiguration: Codable, Sendable, Equatable {
         self.output = output
     }
 
-    /// Configurazione di default: una sorgente pattern di test e una scena che
-    /// la mostra a schermo intero. Utile per vedere subito l'anteprima senza
-    /// permessi di sistema.
+    /// Configurazione di default: una sorgente pattern di test e due scene (a
+    /// schermo intero e centrata) per dimostrare lo switching con dissolvenza,
+    /// senza permessi di sistema.
     public static var demo: AppConfiguration {
         let source = SourceDescriptor(name: "Pattern di test", config: .testPattern)
-        let layer = SceneLayer(name: "Pattern", sourceID: source.id)
-        let scene = Scene(name: "Scena principale", layers: [layer])
+
+        let full = SceneLayer(name: "Pattern", sourceID: source.id, transform: .fullscreen)
+        let sceneA = Scene(name: "Scena principale", layers: [full])
+
+        let centered = SceneLayer(
+            name: "Pattern (riquadro)",
+            sourceID: source.id,
+            transform: LayerTransform(rect: CGRect(x: 0.2, y: 0.18, width: 0.6, height: 0.64))
+        )
+        let sceneB = Scene(name: "Intermezzo", layers: [centered])
+
         return AppConfiguration(
             sources: [source],
-            scenes: [scene],
-            activeSceneID: scene.id,
+            scenes: [sceneA, sceneB],
+            activeSceneID: sceneA.id,
             output: OutputSettings()
         )
     }

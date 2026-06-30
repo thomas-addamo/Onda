@@ -23,7 +23,7 @@ public final class StreamSession: @unchecked Sendable {
 
     private let stateLock = UnfairLock()
     private var previewLayer: CAMetalLayer?
-    private var currentScene: Scene?
+    private var sceneController: SceneController?
     private var outputSettings = OutputSettings()
 
     /// Statistiche di frame time della composizione (lette dalla UI).
@@ -69,9 +69,11 @@ public final class StreamSession: @unchecked Sendable {
             OndaLog.audio.error("Audio non avviato: \(String(describing: error))")
         }
 
-        let scene = configuration.scenes.first { $0.id == configuration.activeSceneID }
-            ?? configuration.scenes.first
-        stateLock.locked { self.currentScene = scene }
+        let controller = SceneController(
+            scenes: configuration.scenes,
+            activeID: configuration.activeSceneID
+        )
+        stateLock.locked { self.sceneController = controller }
 
         let link = try DisplayLinkDriver { [weak self] _ in
             self?.renderTick()
@@ -160,23 +162,29 @@ public final class StreamSession: @unchecked Sendable {
         statsLock.locked { stats.averageMillis }
     }
 
-    /// Cambia la scena attiva (transizione istantanea per ora).
-    public func setActiveScene(_ scene: Scene) {
-        stateLock.locked { self.currentScene = scene }
+    /// Cambia scena con transizione (dissolvenza di default).
+    public func switchToScene(id: UUID, kind: TransitionKind = .fade, duration: Double = 0.4) {
+        let controller = stateLock.locked { sceneController }
+        controller?.switchTo(id, kind: kind, duration: duration)
+    }
+
+    /// ID della scena attualmente attiva.
+    public func activeSceneID() -> UUID? {
+        stateLock.locked { sceneController }?.activeSceneID
     }
 
     // MARK: - Render loop
 
     private func renderTick() {
         // Snapshot atomico dello stato condiviso col main thread.
-        let scene: Scene?
+        let controller: SceneController?
         let layer: CAMetalLayer?
         let isRec: Bool
         let target: PixelBufferRenderTarget?
         let enc: VideoEncoder?
         let fps: Int
-        (scene, layer, isRec, target, enc, fps) = stateLock.locked {
-            (currentScene, previewLayer, recording, outputTarget, encoder, outputSettings.format.frameRate)
+        (controller, layer, isRec, target, enc, fps) = stateLock.locked {
+            (sceneController, previewLayer, recording, outputTarget, encoder, outputSettings.format.frameRate)
         }
 
         guard let layer, let drawable = layer.nextDrawable() else { return }
@@ -184,12 +192,15 @@ public final class StreamSession: @unchecked Sendable {
 
         let startTicks = HighResClock.nowTicks()
 
+        // Piano di rendering: una scena, oppure due durante una dissolvenza.
+        let passes = controller?.renderPlan() ?? []
+
         var draws: [Compositor.LayerDraw] = []
         // Trattiene i wrapper CVMetalTexture finche' la GPU non ha finito.
         var retained: [CVMetalTexture] = []
 
-        if let scene {
-            for sceneLayer in scene.layers where sceneLayer.isVisible {
+        for pass in passes {
+            for sceneLayer in pass.scene.layers where sceneLayer.isVisible {
                 guard let frame = sources.latestFrame(for: sceneLayer.sourceID),
                       let mapped = try? mapper.map(frame.pixelBuffer) else { continue }
                 retained.append(mapped.backing)
@@ -199,7 +210,8 @@ public final class StreamSession: @unchecked Sendable {
                     Float(t.rect.width), Float(t.rect.height)
                 )
                 draws.append(Compositor.LayerDraw(
-                    texture: mapped.texture, rect: rect, opacity: Float(t.opacity)
+                    texture: mapped.texture, rect: rect,
+                    opacity: Float(t.opacity) * pass.globalOpacity
                 ))
             }
         }
