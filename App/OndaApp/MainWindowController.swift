@@ -12,6 +12,9 @@ final class MainWindowController: NSWindowController {
     private let device = MTLCreateSystemDefaultDevice()
     private var session: StreamSession?
     private var programPreview: MetalPreviewView?
+    private var recordButton: NSButton?
+    private var meters: [NSLevelIndicator] = []
+    private var meterTimer: Timer?
 
     init() {
         let window = NSWindow(
@@ -57,8 +60,41 @@ final class MainWindowController: NSWindowController {
                 do { try await session.start(configuration: config) }
                 catch { OndaLog.app.error("Avvio sessione fallito: \(String(describing: error))") }
             }
+            startMeterUpdates()
         } catch {
             OndaLog.app.error("StreamSession non creata: \(String(describing: error))")
+        }
+    }
+
+    /// Aggiorna i meter audio a 30Hz leggendo i livelli pre-calcolati dalla
+    /// sessione (mai bloccando il loop critico).
+    private func startMeterUpdates() {
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self, let session = self.session else { return }
+            let levels = session.audioLevels()
+            for (index, meter) in self.meters.enumerated() {
+                let level = index < levels.count ? levels[index].level : 0
+                // RMS -> scala 0...100 con un minimo di reattivita' visiva.
+                meter.doubleValue = Double(min(1, level * 3)) * 100
+            }
+        }
+    }
+
+    @objc private func toggleRecording(_ sender: NSButton) {
+        guard let session else { return }
+        if session.isRecording {
+            session.stopRecording()
+            sender.title = "⦿ Registra"
+            sender.contentTintColor = .systemOrange
+        } else {
+            do {
+                let url = try session.startRecording()
+                sender.title = "■ Stop"
+                sender.contentTintColor = .systemRed
+                OndaLog.app.info("Registro su \(url.path)")
+            } catch {
+                OndaLog.app.error("Avvio registrazione fallito: \(String(describing: error))")
+            }
         }
     }
 
@@ -220,6 +256,7 @@ final class MainWindowController: NSWindowController {
         meter.doubleValue = 0
         meter.translatesAutoresizingMaskIntoConstraints = false
         meter.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        meters.append(meter)
 
         let slider = NSSlider(value: 0.8, minValue: 0, maxValue: 1, target: nil, action: nil)
 
@@ -233,6 +270,9 @@ final class MainWindowController: NSWindowController {
     private func buildControlButtons() -> NSView {
         let golive = bigButton("● Avvia diretta", color: .systemRed)
         let record = bigButton("⦿ Registra", color: .systemOrange)
+        record.target = self
+        record.action = #selector(toggleRecording(_:))
+        self.recordButton = record
         let camera = bigButton("Camera virtuale", color: .systemBlue)
         let settings = bigButton("Impostazioni", color: .systemGray)
 

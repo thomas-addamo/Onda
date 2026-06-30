@@ -1,9 +1,12 @@
 import Foundation
 import Metal
 import QuartzCore
+import CoreMedia
 import simd
 import OndaShared
 import RenderEngine
+import OutputEngine
+import AudioEngine
 
 /// Coordinatore della pipeline live: collega sorgenti -> compositor -> preview.
 ///
@@ -21,10 +24,20 @@ public final class StreamSession: @unchecked Sendable {
     private let stateLock = UnfairLock()
     private var previewLayer: CAMetalLayer?
     private var currentScene: Scene?
+    private var outputSettings = OutputSettings()
 
     /// Statistiche di frame time della composizione (lette dalla UI).
     private let statsLock = UnfairLock()
     private var stats = FrameTimingStats()
+
+    // Registrazione/encode (accesso protetto da stateLock).
+    private let audioMixer = AudioMixer()
+    private var recording = false
+    private var outputTarget: PixelBufferRenderTarget?
+    private var encoder: VideoEncoder?
+    private var writer: RecordingWriter?
+    private var outputFrameIndex: Int64 = 0
+    private var lastOutputTicks: UInt64 = 0
 
     public init() throws {
         self.context = try MetalContext()
@@ -45,7 +58,17 @@ public final class StreamSession: @unchecked Sendable {
 
     /// Avvia sorgenti, seleziona la scena attiva e fa partire il render loop.
     public func start(configuration: AppConfiguration) async throws {
+        stateLock.locked { self.outputSettings = configuration.output }
         await sources.startSources(from: configuration.sources)
+
+        // L'audio non e' bloccante per il video: in caso di permesso negato o
+        // assenza di dispositivo, logghiamo e proseguiamo col solo video.
+        do {
+            try await audioMixer.start()
+        } catch {
+            OndaLog.audio.error("Audio non avviato: \(String(describing: error))")
+        }
+
         let scene = configuration.scenes.first { $0.id == configuration.activeSceneID }
             ?? configuration.scenes.first
         stateLock.locked { self.currentScene = scene }
@@ -59,9 +82,77 @@ public final class StreamSession: @unchecked Sendable {
     }
 
     public func stop() {
+        if isRecording { stopRecording() }
         displayLink?.stop()
         displayLink = nil
         sources.stopAll()
+        audioMixer.stop()
+    }
+
+    /// Livelli audio correnti per i meter UI: (nome, livello 0...1).
+    public func audioLevels() -> [(name: String, level: Float)] {
+        audioMixer.levels()
+    }
+
+    // MARK: - Registrazione
+
+    public var isRecording: Bool { stateLock.locked { recording } }
+
+    /// Avvia la registrazione su file (cartella Filmati) e restituisce l'URL.
+    @discardableResult
+    public func startRecording() throws -> URL {
+        if isRecording { throw VideoEncoderError.notReady }
+
+        let settings = stateLock.locked { outputSettings }
+        let target = try PixelBufferRenderTarget(
+            context: context,
+            width: settings.format.width,
+            height: settings.format.height
+        )
+        let encoder = VideoEncoder(
+            format: settings.format,
+            codec: settings.codec == .hevc ? .hevc : .h264,
+            bitrate: settings.bitrate
+        )
+        let writer = RecordingWriter()
+        let url = Self.makeOutputURL()
+        try writer.start(to: url)
+        encoder.setEncodedHandler { [weak writer] sample in
+            writer?.append(sample)
+        }
+        try encoder.prepare()
+
+        stateLock.locked {
+            self.outputTarget = target
+            self.encoder = encoder
+            self.writer = writer
+            self.outputFrameIndex = 0
+            self.lastOutputTicks = 0
+            self.recording = true
+        }
+        OndaLog.output.info("Registrazione avviata: \(url.lastPathComponent)")
+        return url
+    }
+
+    public func stopRecording() {
+        let (enc, wr) = stateLock.locked { () -> (VideoEncoder?, RecordingWriter?) in
+            recording = false
+            let e = encoder, w = writer
+            encoder = nil; writer = nil; outputTarget = nil
+            return (e, w)
+        }
+        enc?.finish()
+        wr?.finish {
+            OndaLog.output.info("Registrazione conclusa")
+        }
+    }
+
+    private static func makeOutputURL() -> URL {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return movies.appendingPathComponent("Onda-\(formatter.string(from: Date())).mov")
     }
 
     /// Media corrente del frame time di composizione (ms), per la UI.
@@ -77,7 +168,17 @@ public final class StreamSession: @unchecked Sendable {
     // MARK: - Render loop
 
     private func renderTick() {
-        let (scene, layer) = stateLock.locked { (currentScene, previewLayer) }
+        // Snapshot atomico dello stato condiviso col main thread.
+        let scene: Scene?
+        let layer: CAMetalLayer?
+        let isRec: Bool
+        let target: PixelBufferRenderTarget?
+        let enc: VideoEncoder?
+        let fps: Int
+        (scene, layer, isRec, target, enc, fps) = stateLock.locked {
+            (currentScene, previewLayer, recording, outputTarget, encoder, outputSettings.format.frameRate)
+        }
+
         guard let layer, let drawable = layer.nextDrawable() else { return }
         guard let commandBuffer = context.commandQueue.makeCommandBuffer() else { return }
 
@@ -103,14 +204,47 @@ public final class StreamSession: @unchecked Sendable {
             }
         }
 
+        // Pass di preview sul drawable (refresh nativo del display).
         compositor.compose(layers: draws, into: drawable.texture, commandBuffer: commandBuffer)
+
+        // Pass di output verso l'encoder, con frame pacing al fps configurato.
+        var encodePixelBuffer: CVPixelBuffer?
+        var encodePTS = CMTime.invalid
+        if isRec, let target, let enc, shouldEncodeNow(fps: fps),
+           let out = target.nextTarget() {
+            compositor.compose(layers: draws, into: out.texture, commandBuffer: commandBuffer)
+            retained.append(out.backing)
+            encodePixelBuffer = out.pixelBuffer
+            let index = stateLock.locked { () -> Int64 in
+                let i = outputFrameIndex; outputFrameIndex += 1; return i
+            }
+            encodePTS = CMTime(value: index, timescale: CMTimeScale(fps))
+        }
+
         commandBuffer.addCompletedHandler { _ in
-            _ = retained // mantiene vive le texture sorgente fino a fine GPU
+            _ = retained // mantiene vive le texture sorgente/target fino a fine GPU
+            if let pb = encodePixelBuffer, encodePTS.isValid {
+                try? enc?.encode(pixelBuffer: pb, pts: encodePTS)
+            }
         }
         commandBuffer.present(drawable)
         commandBuffer.commit()
 
         let elapsed = HighResClock.elapsedMillis(since: startTicks)
         statsLock.locked { stats.add(elapsed) }
+    }
+
+    /// True se e' trascorso almeno il budget del frame rate di output dall'ultimo
+    /// frame encodato (disaccoppia l'encode dal refresh del display).
+    private func shouldEncodeNow(fps: Int) -> Bool {
+        let budgetMillis = 1000.0 / Double(max(1, fps))
+        let now = HighResClock.nowTicks()
+        return stateLock.locked {
+            if lastOutputTicks == 0 || HighResClock.millis(fromTicks: now &- lastOutputTicks) >= budgetMillis {
+                lastOutputTicks = now
+                return true
+            }
+            return false
+        }
     }
 }
